@@ -1,176 +1,367 @@
-# Cron Manager
+# 🕒 Scheduler (Fly Cron Manager) — Pipeline `routes:pipeline`
 
-Cron Manager is designed to enhance the way you manage Cron jobs on Fly.io.
+Este documento describe cómo queda planificada y operada la ejecución periódica del pipeline en Fly usando **Cron Manager**, incluyendo comandos de verificación, logs, estado de cola y troubleshooting.
 
-## Key Features and Benefits
+---
 
-### Isolated execution
+## 1) Arquitectura (alto nivel)
 
-Each job runs in its own isolated machine, preventing issues such as configuration drift, accumulation of temporary files, or other residual effects that could impact subsequent job executions. This isolation ensures that the outcome of one job does not negatively influence another, maintaining the integrity and reliability of each job.
+- **App scheduler**: `dt-integration-cron`  
+  Ejecuta **Cron Manager** (daemon) y dispara jobs según `schedules.json`.
+- **App target**: `dt-integration-batch`  
+  Ejecuta el comando real: `php bin/console routes:pipeline --strict-incremental`.
+- **Ejecución por job**: Cron Manager **crea una Machine efímera** (one-off) en `dt-integration-batch` con la imagen especificada.
+- **Anti-concurrencia**: el integrador implementa `job_locks` → si ya hay pipeline corriendo:  
+  `Otro pipeline está en ejecución. Abortando.`
 
-### Centralized Scheduling
+---
 
-Manage all your Cron jobs centrally with a simple JSON configuration. This approach removes the need to embed cron dependencies within each production environment, streamlining setup and modifications. The use of a version-controlled configuration file enhances maintainability and auditability of scheduling changes.
+## 2) Configuración final (scheduler)
 
-### Simplified updates
+### 2.1 `schedules.json` (IMPORTANTE: `command` debe ser string)
 
-Machines dedicated to specific Cron jobs are ephemeral and do not require updates. Any modifications to the schedules.json file will automatically be applied the next time the machine is provisioned for a scheduled job. This eliminates the need for ongoing maintenance of job environments, resulting in a more efficient update process.
+Ejemplo (job ID=1 en la tabla de schedules):
 
-### Enhanced Logs and Monitoring
-
-Operating separate machines for each job greatly simplifies monitoring and auditing. This setup allows for straightforward tracking of the outcomes and logs of individual jobs, facilitating easier debugging and performance analysis.
-
-
-## Getting started
-
-Follow these steps to get your Cron Manager application up and running on Fly.io:
-
-**Clone the project**
-```bash
-git clone git@github.com:fly-apps/cron-manager.git && cd cron-manager
-```
-
-**Create your app (Make sure the app name matches the fly.toml entry)**
-```
-fly apps create <new app name>
-```
-
-**Set your **FLY_API_TOKEN** as a secret**
-```bash
-fly secrets set FLY_API_TOKEN=$(fly auth token)
-```
-
-**Deploy your app**
-```bash
-fly deploy .
-```
-
-
-## Managing Schedules
-
-Schedules are managed using the `schedules.json` file located within the projects root directory. Any new additions, updates, or deletions to this file are automatically reconciled on deploy.
-
-### JSON Fields
-
-- **`name`**: A unique identifier for the schedule. This is used to differentiate new schedules from schedules that need to be updated or deleted.
-  **WARNING: Changing the `name` value after it has been deployed will result in the schedule being deleted and recreated. All historical job references for that schedule will be lost!**
-
-- **`app_name`**: The name of your existing application that the schedule is associated with.  Provisoned Machines associated with each Job will be associated with this App.
-
-- **`schedule`**: The cron expression that defines how often the Job should run. The format follows the standard cron format (minute, hour, day of month, month, day of week).
-
-- **`region`**: The region where the scheduled job will execute.
-
-- **`command`**: The command that will be executed from the provisioned Machine associated with the job.
-
-- **`command_timeout`**: The total amount of time "in seconds" allowed for the command to execute. Default: 30 seconds
-
-- **`enabled`**: A convenience flag that allows you to enable or disable a given schedule. When set to false, the schedule will not trigger any new jobs, but any existing job data will remain unaltered.
-
-- **`config`**: A nested object containing the jobs Machine configuration. See the [Machine Config Spec](https://docs.machines.dev/#tag/machines/post/apps/{app_name}/machines) for more information.
-
-
-### Example Schedule
 ```json
 [
-    {
-        "name": "uptime-check",
-        "app_name": "my-app-name",
-        "schedule": "* * * * *",
-        "region": "iad",
-        "command": "uptime",
-        "command_timeout": 30,
-        "enabled": true,
-        "config": {
-            "metadata": {
-                "fly_process_group": "cron"
-            },
-            "auto_destroy": true,
-            "disable_machine_autostart": true,
-            "guest": {
-                "cpu_kind": "shared",
-                "cpus": 1,
-                "memory_mb": 512
-            },
-            "image": "ghcr.io/livebook-dev/livebook:0.11.4",
-            "restart": {
-                "max_retries": 1,
-                "policy": "no"
-            }
-        }
+  {
+    "name": "routes-pipeline-5m-offset-3",
+    "app_name": "dt-integration-batch",
+    "schedule": "3-59/5 * * * *",
+    "region": "gru",
+    "command": "php bin/console routes:pipeline --strict-incremental",
+    "command_timeout": 300,
+    "enabled": true,
+    "config": {
+      "image": "registry.fly.io/dt-integration-batch:deployment-XXXXXXXXXXXX",
+      "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": 512 },
+      "restart": { "policy": "no" }
     }
+  }
 ]
 ```
 
+Notas críticas
 
+command NO puede ser array (["php", "bin/console", ...]) → debe ser string.
 
-## Viewing Schedules
-To view your registered schedules, you can use the `cm schedules list` command.
+config.image queda pinneada al deployment del integrador. Al redeployar dt-integration-batch cambia el tag.
 
-```bash
-cm schedules list
+### 2.2 fly.toml de dt-integration-cron (volumen requerido)
+
+Cron Manager usa SQLite para store + migraciones. Requiere volumen montado:
+
+```
+app = "dt-integration-cron"
+primary_region = "gru"
+
+[build]
+
+[processes]
+app = "/usr/local/bin/start"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+[[vm]]
+  memory_mb = 512
+  cpus = 1
 ```
 
-Output example:
-```bash
-|----|------------------|-----------------------------------------------|-----------|--------|----------|---------|
-| ID | TARGET APP       | IMAGE                                         | SCHEDULE  | REGION | COMMAND  | ENABLED |
-|----|------------------|-----------------------------------------------|-----------|--------|----------|---------|
-| 1  | my-example-app   | ghcr.io/livebook-dev/livebook:0.11.4          | * * * * * | iad    | sleep 10 | true    |
-| 2  | my-example-app-2 | docker-hub-mirror.fly.io/library/nginx:latest | 0 * * * * | ord    | df -h    | false   |
-|----|------------------|-----------------------------------------------|-----------|--------|----------|---------|
+### 2.3 Volumen data
+
+Cron Manager necesita un volumen data por máquina (en este caso usamos 1 máquina).
+
+Crear volumen (una sola vez):
+
+```
+flyctl volumes create data --app dt-integration-cron --region gru --size 1
+flyctl volumes list -a dt-integration-cron
 ```
 
-## Viewing Scheduled Jobs
-Each job execution is recorded within a local sqlite. To view the job history of a specific schedule, ssh into the Machine and run the following:
+## 3) Autenticación (token correcto)
 
-```bash
-cm jobs list <schedule-id>
+Cron Manager necesita llamar la Fly API para crear Machines en dt-integration-batch.
+
+### 3.1 Token requerido
+
+No sirve “Deploy Token” por app.
+
+Lo correcto es un Org token (API con permisos sobre la org donde vive dt-integration-batch).
+
+Crear token (no pegues el token en chats / issues):
+
+```
+flyctl tokens create org --org contenedores-patagonia
 ```
 
-Output example:
-```bash
-|----|----------------|-----------|-----------|-------------------------|-------------------------|-------------------------|
-| ID | MACHINE ID     | STATUS    | EXIT CODE | CREATED AT              | UPDATED AT              | FINISHED AT             |
-|----|----------------|-----------|-----------|-------------------------|-------------------------|-------------------------|
-| 30 | 185710da967398 | completed | 0         | 2024-04-11 20:03:01 UTC | 2024-04-11 20:03:03 UTC | 2024-04-11 20:03:03 UTC |
-| 29 | 2865d32b356008 | completed | 0         | 2024-04-11 20:02:01 UTC | 2024-04-11 20:02:03 UTC | 2024-04-11 20:02:03 UTC |
-| 28 | 683d67eb056e48 | completed | 0         | 2024-04-11 20:01:01 UTC | 2024-04-11 20:01:04 UTC | 2024-04-11 20:01:04 UTC |
-| 27 | 080e07df930d08 | completed | 0         | 2024-04-11 20:00:01 UTC | 2024-04-11 20:00:06 UTC | 2024-04-11 20:00:06 UTC |
-| 26 | 784e475f51d3e8 | completed | 0         | 2024-04-11 19:59:01 UTC | 2024-04-11 19:59:03 UTC | 2024-04-11 19:59:03 UTC |
-| 25 | 28749e0bd51e68 | completed | 0         | 2024-04-11 19:58:01 UTC | 2024-04-11 19:58:03 UTC | 2024-04-11 19:58:03 UTC |
-| 24 | e82de70b46ed78 | completed | 0         | 2024-04-11 19:57:01 UTC | 2024-04-11 19:57:03 UTC | 2024-04-11 19:57:03 UTC |
-| 23 | d891745b3527d8 | completed | 0         | 2024-04-11 19:56:01 UTC | 2024-04-11 19:56:04 UTC | 2024-04-11 19:56:04 UTC |
-| 22 | 7811372b1e2e68 | completed | 0         | 2024-04-11 19:55:01 UTC | 2024-04-11 19:55:03 UTC | 2024-04-11 19:55:03 UTC |
-| 21 | 185710da967698 | completed | 0         | 2024-04-11 19:54:01 UTC | 2024-04-11 19:54:04 UTC | 2024-04-11 19:54:04 UTC |
-|----|----------------|-----------|-----------|-------------------------|-------------------------|-------------------------|
+Setearlo como secret en dt-integration-cron:
+
+```
+flyctl secrets unset FLY_API_TOKEN -a dt-integration-cron
+flyctl secrets set FLY_API_TOKEN="TOKEN_GENERADO" -a dt-integration-cron
+flyctl secrets list -a dt-integration-cron
 ```
 
-## Viewing a Specific Job
-```bash
-cm jobs show <job-id>
+Reiniciar machine para tomar el secret:
+
+```
+flyctl machine list -a dt-integration-cron
+flyctl machine restart <CRON_MACHINE_ID> -a dt-integration-cron
 ```
 
-Output example:
+## 4) Deploy / actualización del scheduler
+
+Deploy del cron manager:
+
 ```
-Job Details
-  ID          = 30
-  Status      = completed
-  Machine ID  = 2866e19a795908
-  Exit Code   = 0
-  Created At  = 2024-04-15 14:34:01 UTC
-  Updated At  = 2024-04-15 14:34:03 UTC
-  Finished At = 2024-04-15 14:34:03 UTC
-  Stdout      = 
-  Stderr      =
+flyctl deploy -a dt-integration-cron
+flyctl status -a dt-integration-cron
+flyctl machine list -a dt-integration-cron
 ```
 
+## 5) Operación diaria — comandos útiles
 
-## Triggering Off-schedule Jobs
-In the event you would like to trigger a Job "off schedule" for testing, you can do so with the `trigger` command.
+### 5.1 Ver schedules activos
 
-```bash
-cm jobs trigger <schedule-id>
+```
+flyctl ssh console -a dt-integration-cron -C "cm schedules list"
 ```
 
+Deberías ver una fila con:
 
+ID = 1
+
+TARGET APP = dt-integration-batch
+
+SCHEDULE = 3-59/5 \* \* \* \*
+
+### 5.2 Disparar ejecución manual (sin esperar cron)
+
+```
+flyctl ssh console -a dt-integration-cron -C "cm jobs trigger 1"
+```
+
+### 5.3 Ver últimas ejecuciones del schedule (historial)
+
+```
+flyctl ssh console -a dt-integration-cron -C "cm jobs list 1"
+```
+
+Campos típicos:
+
+STATUS: running / success / failed
+
+EXIT CODE
+
+MACHINE ID (de la ejecución en dt-integration-batch)
+
+## 6) Logs (scheduler y jobs)
+
+### 6.1 Logs del cron manager (dt-integration-cron)
+
+Útil para diagnosticar parseo de schedules, fallos de auth, etc.
+
+```
+flyctl logs -a dt-integration-cron
+```
+
+### 6.2 Logs del integrador (target) global
+
+Muestra todo lo que ejecuta dt-integration-batch, incluyendo jobs efímeros.
+
+```
+flyctl logs -a dt-integration-batch
+```
+
+### 6.3 Logs de una ejecución específica (por Machine ID)
+
+Cuando cm jobs list 1 entrega MACHINE ID, puedes filtrar:
+
+```
+flyctl logs -a dt-integration-batch -i <MACHINE_ID_DEL_JOB>
+```
+
+Esto es el “debug perfecto” para un run puntual del pipeline.
+
+## 7) Estado de la cola (Dispatch Queue) / queries operativas
+
+Requiere conectarse a la base Supabase/Postgres donde está dispatch_queue.
+Usa tu método habitual (psql / consola / admin UI). Aquí va el set mínimo de queries.
+
+### 7.1 Conteo por acción / estado básico
+
+```
+-- Total por acción
+select action, count(*)
+from dispatch_queue
+group by action
+order by action;
+
+-- Pendientes (ajusta según tu modelo: processed_at/status/attempts)
+-- Ejemplo si existe processed_at:
+select action, count(*)
+from dispatch_queue
+where processed_at is null
+group by action
+order by action;
+```
+
+### 7.2 Jobs en error / retries
+
+```
+-- Ejemplo si hay status + attempts
+select action, count(*)
+from dispatch_queue
+where status = 'error'
+group by action;
+
+select *
+from dispatch_queue
+where status = 'error'
+order by updated_at desc
+limit 50;
+```
+
+### 7.3 Últimos jobs procesados
+
+```
+-- Ajusta columnas a tu esquema real
+select *
+from dispatch_queue
+order by updated_at desc
+limit 50;
+```
+
+### 7.4 Ver un dispatch específico
+
+```
+select *
+from dispatch_queue
+where dispatch_identifier = 'CP-27042'
+order by tran_id;
+```
+
+## 8) Verificación del lock del pipeline (job_locks)
+
+Ajusta nombres/columnas si varían en tu implementación.
+
+### 8.1 Ver locks actuales
+
+```
+select *
+from job_locks
+order by created_at desc;
+```
+
+### 8.2 Limpieza manual (solo si queda “pegado” por caída)
+
+```
+-- Ejemplo: borra lock del pipeline si quedó huérfano
+delete from job_locks
+where job_name = 'routes:pipeline';
+```
+
+Recomendación: preferir que el lock expire (TTL) si lo implementaste; borrar manual solo si confirmas que no hay job corriendo.
+
+## 9) Actualización de imagen cuando se redeploya dt-integration-batch
+
+Cron Manager está pinneado a la imagen del integrador. Si haces deploy del integrador y cambia el tag, debes actualizar schedules.json.
+
+### 9.1 Obtener imagen vigente del integrador
+
+```
+flyctl image show -a dt-integration-batch
+```
+
+Ejemplo de ref:
+registry.fly.io/dt-integration-batch:deployment-01KJ...
+
+### 9.2 Actualizar schedules.json + redeploy cron-manager
+
+Editar schedules.json → reemplazar config.image.
+
+Deploy:
+
+```
+flyctl deploy -a dt-integration-cron
+```
+
+Verificar:
+
+```
+flyctl ssh console -a dt-integration-cron -C "cm schedules list"
+```
+
+## 10) Troubleshooting (casos reales y cómo resolver)
+
+### 10.1 cm schedules list aparece vacío
+
+Causa típica: command estaba como array en JSON.
+Fix: dejar command como string y redeploy.
+
+```
+flyctl deploy -a dt-integration-cron
+flyctl ssh console -a dt-integration-cron -C "cm schedules list"
+```
+
+### 10.2 failed to create store ... unable to open database file
+
+Causa: faltaba volumen data / mount /data.
+Fix:
+
+crear volumen
+
+agregar [[mounts]] y redeploy
+
+```
+flyctl volumes create data --app dt-integration-cron --region gru --size 1
+flyctl deploy -a dt-integration-cron
+```
+
+### 10.3 failed to launch VM: unauthorized
+
+Causa: token incorrecto (deploy token) o sin permisos.
+Fix: crear org token y setear como secret.
+
+```
+flyctl tokens create org --org contenedores-patagonia
+flyctl secrets set FLY_API_TOKEN="TOKEN" -a dt-integration-cron
+flyctl machine restart <CRON_MACHINE_ID> -a dt-integration-cron
+```
+
+### 10.4 Jobs seguidos “Abortando: otro pipeline en ejecución”
+
+Causa: cron muy frecuente y pipeline tarda más que el intervalo.
+Fix (opcional):
+
+mantener 5 min y aceptar abortos (funcional)
+
+o subir intervalo (ej. cada 10 min):
+
+3-59/10 \* \* \* \*
+
+Actualizar schedules.json y redeploy.
+
+## 11) Comandos de referencia (copypaste)
+
+Scheduler
+
+```
+flyctl status -a dt-integration-cron
+flyctl machine list -a dt-integration-cron
+flyctl logs -a dt-integration-cron
+flyctl ssh console -a dt-integration-cron -C "cm schedules list"
+flyctl ssh console -a dt-integration-cron -C "cm jobs list 1"
+flyctl ssh console -a dt-integration-cron -C "cm jobs trigger 1"
+```
+
+Target (integrador)
+
+```
+flyctl status -a dt-integration-batch
+flyctl logs -a dt-integration-batch
+flyctl logs -a dt-integration-batch -i <MACHINE_ID>
+flyctl image show -a dt-integration-batch
+```

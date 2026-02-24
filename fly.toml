@@ -1,16 +1,15 @@
-# fly.toml app configuration file generated for cron-manager on 2024-04-11T14:24:13-05:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+app = "dt-integration-cron"
+primary_region = "gru"
 
-app = 'cron-manager'
-primary_region = 'ord'
+[build]
+
+[processes]
+app = "/usr/local/bin/start"
 
 [[mounts]]
-  source = 'data'
-  destination = '/data'
+  source = "data"
+  destination = "/data"
 
 [[vm]]
-  memory = '256mb'
-  cpu_kind = 'shared'
+  memory_mb = 512
   cpus = 1

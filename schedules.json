@@ -1,0 +1,16 @@
+[
+  {
+    "name": "routes-pipeline-5m-offset-3",
+    "app_name": "dt-integration-batch",
+    "schedule": "3-59/5 * * * *",
+    "region": "gru",
+    "command": "php bin/console routes:pipeline --strict-incremental",
+    "command_timeout": 300,
+    "enabled": true,
+    "config": {
+      "image": "registry.fly.io/dt-integration-batch:deployment-01KJ85PVBHFWAEYSCT66YYGMWS",
+      "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": 512 },
+      "restart": { "policy": "no" }
+    }
+  }
+]
