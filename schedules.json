@@ -9,9 +9,10 @@
     "enabled": true,
     "config": {
       "auto_destroy": true,
-      "image": "registry.fly.io/dt-integration-batch:deployment-01KJWHEJSQA8Q79MH3Y9Q9BDBH",
+      "image": "registry.fly.io/dt-integration-batch:deployment-01KJXEDDEX4ZFSDBQK10RQNZER",
       "guest": { "cpu_kind": "shared", "cpus": 1, "memory_mb": 512 },
       "restart": { "policy": "no" }
     }
   }
 ]
+
