@@ -365,3 +365,5 @@ flyctl logs -a dt-integration-batch
 flyctl logs -a dt-integration-batch -i <MACHINE_ID>
 flyctl image show -a dt-integration-batch
 ```
+
+## ACTUALIZAR SCHEDULES.JSON EL CONFIG/IMAGE AL NUEVO DEPLOY DEL INTEGRADOR (TAG)
